@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 
-const API = "http://localhost:8000";
+const API = "https://resumeats-1-l39r.onrender.com";
 
 // ─── tiny hooks ───────────────────────────────────────────────────────────────
 function useCategories() {
