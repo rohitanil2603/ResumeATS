@@ -1,0 +1,19 @@
+{
+  "name": "resume-ats-backend",
+  "version": "0.1.0",
+  "description": "Backend for the AI Resume Optimizer & ATS Analyzer (Phase 2-9 MVP, embedding-free).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "cors": "^2.8.5",
+    "pdf-parse": "^1.1.1",
+    "csv-parse": "^5.5.6",
+    "dotenv": "^16.4.5",
+    "@xenova/transformers": "^2.17.2"
+  }
+}

@@ -1,0 +1,503 @@
+// server.js
+// Minimal Express backend for the AI Resume Optimizer & ATS Analyzer.
+// Covers Phase 2 (PDF text extraction), Phase 3 (LLM-based skill parsing),
+// Phase 4 (job lookup from jobs.csv), Phase 5-6 (local embedding similarity),
+// Phase 7-9 (weighted score + gaps).
+//
+// Resume/JD skill extraction goes through an OpenRouter LLM with a model
+// rollback list (Phase 3). Semantic similarity (Phase 5/6) runs locally via
+// @xenova/transformers (all-MiniLM-L6-v2, ONNX) — no API key or per-request
+// cost. Both paths fall back gracefully (dictionary matcher / skill-overlap
+// score) if the LLM or the embedding model is unavailable.
+
+require("dotenv").config();
+
+const express = require("express");
+const multer = require("multer");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const pdfParse = require("pdf-parse");
+const { parse: parseCsv } = require("csv-parse/sync");
+const { pipeline } = require("@xenova/transformers");
+
+const app = express();
+const PORT = process.env.PORT || 8000;
+// Resolved relative to CWD (not __dirname) so a .env value like
+// "./JobSpy/jobs.csv" works when you run `node server.js` from repo root.
+const JOBS_CSV_PATH = path.resolve(process.env.JOBS_CSV_PATH || "./jobs.csv");
+
+// ── OpenRouter (LLM extraction) ──────────────────────────────────────────
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY;
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+
+// Tried in order per request; first one that returns valid JSON wins.
+// gpt-oss-120b first: messy real-world resume text (weird spacing, merged
+// columns from pdf-parse) tends to break small models' JSON formatting more
+// often, so lead with the stronger free model and roll back to the small,
+// fast one if it's rate-limited or down. Flip the order if you'd rather
+// optimize for latency over first-try reliability.
+const MODEL_FALLBACK_LIST = ["openai/gpt-oss-120b:free", "qwen/qwen3-4b:free"];
+
+app.use(cors()); // lock this down to your frontend origin before deploying
+app.use(express.json());
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB, matches frontend check
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype !== "application/pdf") {
+            return cb(new Error("Only PDF files are accepted"));
+        }
+        cb(null, true);
+    },
+});
+
+// ── Jobs store ──────────────────────────────────────────────────────────
+// Loaded once at boot from jobs.csv. Re-run the scraper + restart the
+// server to refresh, or swap this for a real Postgres/MySQL query later.
+let JOBS = [];
+
+function loadJobs() {
+    if (!fs.existsSync(JOBS_CSV_PATH)) {
+        console.warn(`jobs.csv not found at ${JOBS_CSV_PATH} — job-select mode will return empty.`);
+        JOBS = [];
+        return;
+    }
+    const raw = fs.readFileSync(JOBS_CSV_PATH, "utf8");
+    const rows = parseCsv(raw, { columns: true, skip_empty_lines: true, relax_quotes: true });
+    JOBS = rows.map((r) => ({
+        id: r.id,
+        title: r.title || "",
+        company: r.company || "",
+        location: r.location || "",
+        description: r.description || "",
+        skills: r.skills || "",
+    }));
+    console.log(`Loaded ${JOBS.length} jobs from ${JOBS_CSV_PATH}`);
+}
+
+loadJobs();
+
+// ── Embeddings (Phase 5-6, local — no API key needed) ────────────────────
+// Loaded once, lazily, on first use — then reused for every request.
+// Model downloads (~90MB) from Hugging Face on first run only; after that
+// it's cached locally by @xenova/transformers.
+const EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2";
+let embedderPromise = null;
+
+function getEmbedder() {
+    if (!embedderPromise) {
+        console.log(`Loading embedding model ${EMBEDDING_MODEL} (first run downloads it)...`);
+        embedderPromise = pipeline("feature-extraction", EMBEDDING_MODEL);
+    }
+    return embedderPromise;
+}
+
+// Kick off the download/load at boot so the first real request isn't slow.
+getEmbedder()
+    .then(() => console.log("Embedding model ready."))
+    .catch((err) => console.warn("Embedding model failed to preload:", err.message));
+
+async function embedText(text) {
+    const embedder = await getEmbedder();
+    // Truncate — the model has a token limit anyway, and resumes/JDs rarely
+    // need more than the first couple thousand characters to convey their gist.
+    const output = await embedder(text.slice(0, 2000), { pooling: "mean", normalize: true });
+    return Array.from(output.data);
+}
+
+function cosineSimilarity(a, b) {
+    // Vectors are already L2-normalized (normalize: true above), so the dot
+    // product IS the cosine similarity — no need to divide by magnitudes.
+    let dot = 0;
+    for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+    return dot;
+}
+
+// Returns a 0-1 similarity score, or null if the embedding model isn't
+// available (still loading, failed to download, etc.) so callers can fall
+// back to the skill/keyword-overlap approximation instead.
+async function computeSemanticSimilarity(resumeText, jdText) {
+    try {
+        const [resumeEmbedding, jdEmbedding] = await Promise.all([
+            embedText(resumeText),
+            embedText(jdText),
+        ]);
+        const rawSimilarity = cosineSimilarity(resumeEmbedding, jdEmbedding);
+        // Cosine similarity between unrelated text rarely goes below ~0.1-0.2 with
+        // this model, so raw scores compress into a narrow band. Clamp to [0,1]
+        // for display; consider re-scaling later if scores cluster too tightly.
+        return Math.max(0, Math.min(1, rawSimilarity));
+    } catch (err) {
+        console.warn("Embedding similarity failed, falling back to overlap approximation:", err.message);
+        return null;
+    }
+}
+
+// ── Skill dictionary ────────────────────────────────────────────────────
+// Naive keyword list for MVP skill extraction. Replace with spaCy/LLM-based
+// extraction (Phase 3) once the pipeline is proven end to end.
+const SKILL_DICTIONARY = [
+    "python", "java", "javascript", "typescript", "react", "node", "node.js", "express",
+    "fastapi", "flask", "django", "docker", "kubernetes", "aws", "azure", "gcp",
+    "sql", "postgresql", "mysql", "mongodb", "redis", "kafka", "rest api", "graphql",
+    "ci/cd", "git", "microservices", "agile", "scrum", "html", "css", "tailwind",
+    "next.js", "vue", "angular", "spring", "spring boot", "c++", "c#", "go", "rust",
+    "machine learning", "deep learning", "nlp", "pandas", "numpy", "tensorflow",
+    "pytorch", "scikit-learn", "spark", "hadoop", "terraform", "jenkins", "linux",
+    "bash", "shell scripting", "elasticsearch", "rabbitmq", "grpc", "websockets",
+];
+
+function extractSkills(text) {
+    const lower = text.toLowerCase();
+    return SKILL_DICTIONARY.filter((skill) => lower.includes(skill));
+}
+
+// Pulls out capitalized-ish multi-word phrases and common resume keywords
+// missed by the fixed dictionary. Kept intentionally simple for the MVP.
+function extractKeywords(text, limit = 25) {
+    const stopwords = new Set([
+        "the", "and", "for", "with", "you", "your", "our", "are", "will", "have",
+        "this", "that", "from", "who", "role", "team", "work", "experience", "job",
+    ]);
+    const words = text
+        .toLowerCase()
+        .replace(/[^a-z0-9+#. ]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length > 3 && !stopwords.has(w));
+
+    const freq = {};
+    for (const w of words) freq[w] = (freq[w] || 0) + 1;
+
+    return Object.entries(freq)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, limit)
+        .map(([word]) => word);
+}
+
+// ── LLM extraction (Phase 3, with rollback) ─────────────────────────────
+
+function stripJsonFences(content) {
+    return content
+        .trim()
+        .replace(/^```json\s*/i, "")
+        .replace(/^```\s*/, "")
+        .replace(/```\s*$/, "");
+}
+
+// Tries each model in MODEL_FALLBACK_LIST in order. Rolls back to the next
+// model on any failure: HTTP error, empty response, or invalid JSON. Throws
+// only after every model has failed.
+async function callOpenRouterJSON(systemPrompt, userPrompt) {
+    if (!OPENROUTER_API_KEY) {
+        throw new Error("No OPENROUTER_API_KEY (or OPENAI_API_KEY) set");
+    }
+
+    let lastErr;
+    for (const model of MODEL_FALLBACK_LIST) {
+        try {
+            const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+                },
+                body: JSON.stringify({
+                    model,
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: userPrompt },
+                    ],
+                    temperature: 0.1,
+                }),
+            });
+
+            if (!res.ok) {
+                const errText = await res.text().catch(() => "");
+                throw new Error(`${model} returned HTTP ${res.status}: ${errText.slice(0, 200)}`);
+            }
+
+            const data = await res.json();
+            const content = data?.choices?.[0]?.message?.content;
+            if (!content) throw new Error(`${model} returned empty content`);
+
+            const parsed = JSON.parse(stripJsonFences(content));
+            return { parsed, modelUsed: model };
+        } catch (err) {
+            console.warn(`[LLM rollback] ${model} failed — ${err.message}`);
+            lastErr = err;
+            // fall through to the next model in the list
+        }
+    }
+    throw lastErr || new Error("All models in MODEL_FALLBACK_LIST failed");
+}
+
+const RESUME_EXTRACTION_PROMPT = `You extract structured data from resumes.
+Respond with ONLY valid JSON — no markdown fences, no commentary, no explanation.
+Schema:
+{"skills": string[], "education": string[], "experience": string[], "projects": string[], "certificates": string[]}
+Rules:
+- "skills" = technical skills, tools, languages, frameworks — lowercase, deduplicated, short items (e.g. "python", "docker", "rest api")
+- Other arrays hold short summaries of each item found in that section
+- If a section is absent from the resume, return an empty array for it
+- Never invent information that isn't in the resume text`;
+
+const JD_EXTRACTION_PROMPT = `You extract structured requirements from a job description.
+Respond with ONLY valid JSON — no markdown fences, no commentary, no explanation.
+Schema:
+{"skills": string[], "certifications": string[], "keywords": string[]}
+Rules:
+- "skills" = required technical skills, tools, languages, frameworks, platforms — lowercase, deduplicated, short items (e.g. "python", "azure", "power automate")
+- "certifications" = named credentials or certification requirements (e.g. "az-204", "pmp") — keep these OUT of "skills"
+- "keywords" = concrete methodologies, responsibilities, or domain terms a resume could reasonably include (e.g. "agile", "ci/cd", "cross-functional collaboration", "data migration")
+- Do NOT include generic corporate boilerplate in "keywords": company culture, benefits, diversity/inclusion statements, work-hour or shift details, office-location or remote-work policy, or soft "executive presence" style phrases. Only include terms that describe what the candidate would actually do or know.
+- Cap each array at 20 items`;
+
+async function extractResumeData(resumeText) {
+    if (!OPENROUTER_API_KEY) {
+        return { skills: extractSkills(resumeText), method: "dictionary" };
+    }
+    try {
+        // Truncate to keep prompts small and fast on free-tier models.
+        const { parsed, modelUsed } = await callOpenRouterJSON(
+            RESUME_EXTRACTION_PROMPT,
+            `Resume text:\n\n${resumeText.slice(0, 6000)}`
+        );
+        return {
+            skills: (parsed.skills || []).map((s) => String(s).toLowerCase().trim()),
+            education: parsed.education || [],
+            experience: parsed.experience || [],
+            projects: parsed.projects || [],
+            certificates: parsed.certificates || [],
+            method: "llm",
+            model: modelUsed,
+        };
+    } catch (err) {
+        console.warn("Resume LLM extraction failed, falling back to dictionary:", err.message);
+        return { skills: extractSkills(resumeText), method: "dictionary" };
+    }
+}
+
+async function extractJDData(jdText) {
+    if (!OPENROUTER_API_KEY) {
+        return {
+            skills: extractSkills(jdText),
+            keywords: extractKeywords(jdText, 30),
+            certifications: [],
+            method: "dictionary",
+        };
+    }
+    try {
+        const { parsed, modelUsed } = await callOpenRouterJSON(
+            JD_EXTRACTION_PROMPT,
+            `Job description:\n\n${jdText.slice(0, 4000)}`
+        );
+        return {
+            skills: (parsed.skills || []).map((s) => String(s).toLowerCase().trim()),
+            keywords: (parsed.keywords || []).map((s) => String(s).toLowerCase().trim()),
+            certifications: (parsed.certifications || []).map((s) => String(s).toLowerCase().trim()),
+            method: "llm",
+            model: modelUsed,
+        };
+    } catch (err) {
+        console.warn("JD LLM extraction failed, falling back to dictionary:", err.message);
+        return {
+            skills: extractSkills(jdText),
+            keywords: extractKeywords(jdText, 30),
+            certifications: [],
+            method: "dictionary",
+        };
+    }
+}
+
+// ── Scoring (Phase 7-9) ──────────────────────────────────────────────────
+// `semanticSimilarity` is a 0-1 score from embeddings (Phase 5/6). Pass
+// `null` to fall back to the skill/keyword-overlap approximation — used
+// when the embedding model isn't available for some reason.
+function computeScore({ resumeSkills, jdSkills, jdKeywords, resumeText, semanticSimilarity }) {
+    const resumeSkillSet = new Set(resumeSkills.map((s) => s.toLowerCase()));
+    const resumeTextLower = resumeText.toLowerCase();
+
+    const matchedSkills = jdSkills.filter((s) => resumeSkillSet.has(s.toLowerCase()));
+    const missingSkills = jdSkills.filter((s) => !resumeSkillSet.has(s.toLowerCase()));
+    const missingKeywords = jdKeywords.filter((k) => !resumeTextLower.includes(k.toLowerCase()));
+
+    const skillMatchPct = jdSkills.length ? matchedSkills.length / jdSkills.length : 1;
+    const keywordMatchPct = jdKeywords.length
+        ? (jdKeywords.length - missingKeywords.length) / jdKeywords.length
+        : 1;
+
+    const usingRealEmbeddings = semanticSimilarity !== null && semanticSimilarity !== undefined;
+    const finalSemanticSimilarity = usingRealEmbeddings
+        ? semanticSimilarity
+        : (skillMatchPct + keywordMatchPct) / 2; // overlap-based fallback
+
+    const weights = {
+        semanticSimilarity: 0.4,
+        skillMatch: 0.2,
+        keywordMatch: 0.1,
+        // experience/education/formatting/grammar need dedicated passes —
+        // fixed placeholder scores for now so the total still sums sensibly
+        experienceMatch: 0.15,
+        educationMatch: 0.05,
+        formatting: 0.05,
+        grammar: 0.05,
+    };
+    const placeholderFullMarks = 1;
+
+    const atsScore = Math.round(
+        100 *
+        (weights.semanticSimilarity * finalSemanticSimilarity +
+            weights.skillMatch * skillMatchPct +
+            weights.keywordMatch * keywordMatchPct +
+            weights.experienceMatch * placeholderFullMarks +
+            weights.educationMatch * placeholderFullMarks +
+            weights.formatting * placeholderFullMarks +
+            weights.grammar * placeholderFullMarks)
+    );
+
+    return {
+        ats_score: atsScore,
+        match_percent: Math.round(finalSemanticSimilarity * 100),
+        semantic_similarity_method: usingRealEmbeddings ? "embeddings" : "overlap-fallback",
+        resume_skills: resumeSkills,
+        jd_skills: jdSkills,
+        matched_skills: matchedSkills,
+        missing_skills: missingSkills,
+        missing_keywords: missingKeywords,
+        note: usingRealEmbeddings
+            ? "Semantic similarity from local all-MiniLM-L6-v2 embeddings."
+            : "Embedding model unavailable this request — semantic similarity fell back to skill/keyword overlap.",
+    };
+}
+
+// ── Routes ──────────────────────────────────────────────────────────────
+
+app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", jobs_loaded: JOBS.length });
+});
+
+// GET /api/jobs?search=engineer&limit=20
+// Powers the "pick from database" dropdown on the frontend.
+app.get("/api/jobs", (req, res) => {
+    const { search = "", limit = 20 } = req.query;
+    const q = String(search).toLowerCase();
+
+    let results = JOBS;
+    if (q) {
+        results = JOBS.filter(
+            (j) =>
+                j.title.toLowerCase().includes(q) ||
+                j.company.toLowerCase().includes(q) ||
+                j.location.toLowerCase().includes(q)
+        );
+    }
+
+    const limited = results.slice(0, Number(limit)).map(({ id, title, company, location }) => ({
+        id,
+        title,
+        company,
+        location,
+    }));
+
+    res.json({ jobs: limited, total_matched: results.length });
+});
+
+// POST /api/analyze
+// multipart/form-data: resume=<PDF file>, and either job_id=<string> or jd_text=<string>
+app.post("/api/analyze", upload.single("resume"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "Missing 'resume' file in form data." });
+        }
+
+        const { job_id, jd_text } = req.body;
+        let jdText = "";
+        let jobMeta = null;
+
+        if (job_id) {
+            const job = JOBS.find((j) => j.id === job_id);
+            if (!job) {
+                return res.status(404).json({ error: `No job found with id '${job_id}'.` });
+            }
+            jdText = job.description || `${job.title} ${job.skills}`;
+            jobMeta = { id: job.id, title: job.title, company: job.company, location: job.location };
+        } else if (jd_text && jd_text.trim().length >= 30) {
+            jdText = jd_text.trim();
+        } else {
+            return res.status(400).json({ error: "Provide either 'job_id' or 'jd_text' (30+ chars)." });
+        }
+
+        const parsed = await pdfParse(req.file.buffer);
+        const resumeText = parsed.text || "";
+
+        if (resumeText.trim().length < 50) {
+            return res.status(422).json({
+                error: "Couldn't extract readable text from this PDF. Is it a scanned image?",
+            });
+        }
+
+        // Resume/JD skill extraction (LLM) and semantic similarity (local
+        // embeddings) all run in parallel — they're independent of each other.
+        const [resumeData, jdData, semanticSimilarity] = await Promise.all([
+            extractResumeData(resumeText),
+            extractJDData(jdText),
+            computeSemanticSimilarity(resumeText, jdText),
+        ]);
+
+        const scoring = computeScore({
+            resumeSkills: resumeData.skills,
+            jdSkills: jdData.skills,
+            jdKeywords: jdData.keywords || [],
+            resumeText,
+            semanticSimilarity,
+        });
+
+        // Certifications are named credentials, not skills — checked separately
+        // as a simple substring match rather than folded into the skill score.
+        const resumeTextLower = resumeText.toLowerCase();
+        const requiredCertifications = jdData.certifications || [];
+        const missingCertifications = requiredCertifications.filter(
+            (c) => !resumeTextLower.includes(c.toLowerCase())
+        );
+
+        res.json({
+            job: jobMeta,
+            resume_char_count: resumeText.length,
+            extraction: {
+                resume_method: resumeData.method,
+                resume_model: resumeData.model || null,
+                jd_method: jdData.method,
+                jd_model: jdData.model || null,
+            },
+            required_certifications: requiredCertifications,
+            missing_certifications: missingCertifications,
+            resume_details:
+                resumeData.method === "llm"
+                    ? {
+                        education: resumeData.education,
+                        experience: resumeData.experience,
+                        projects: resumeData.projects,
+                        certificates: resumeData.certificates,
+                    }
+                    : undefined,
+            ...scoring,
+        });
+    } catch (err) {
+        console.error("Error in /api/analyze:", err);
+        res.status(500).json({ error: err.message || "Internal server error." });
+    }
+});
+
+// Multer errors (bad file type, too large) land here
+app.use((err, req, res, next) => {
+    if (err instanceof multer.MulterError || err.message === "Only PDF files are accepted") {
+        return res.status(400).json({ error: err.message });
+    }
+    next(err);
+});
+
+app.listen(PORT, () => {
+    console.log(`Resume analyzer backend running on http://localhost:${PORT}`);
+});
