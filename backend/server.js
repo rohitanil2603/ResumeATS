@@ -14,49 +14,68 @@ const PORT = process.env.PORT || 8000;
 
 const JOBS_CSV_PATH = path.resolve(process.env.JOBS_CSV_PATH || "./jobs.csv");
 
-// ─── OpenRouter ────────────────────────────────────────────────────────────────
-const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+// ─── Provider config ───────────────────────────────────────────────────────────
+//
+// Three providers, tried in order per request. Combined free capacity:
+//   Gemini 2.5 Flash  — 1,500 req/day, 10 RPM  (best free frontier model)
+//   Groq Llama 70B    — 1,000 req/day, 30 RPM  (fast, OpenAI-compatible)
+//   OpenRouter        —    50 req/day           (last resort, model variety)
+//
+// Add keys to .env — any missing provider is silently skipped.
+// GEMINI_API_KEY      — get free at aistudio.google.com
+// GROQ_API_KEY        — get free at console.groq.com  (no card required)
+// OPENROUTER_API_KEY  — get free at openrouter.ai
+// OPENROUTER_API_KEY_2 — second OpenRouter account for +50 req/day
 
-// Multiple accounts → automatic key rotation on 429. Each free account
-// gets 50 req/day, so two accounts effectively doubles your daily budget.
-const OPENROUTER_API_KEYS = [
-    process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY,
-    process.env.OPENROUTER_API_KEY_2,
-    process.env.OPENROUTER_API_KEY_3,
-].filter(Boolean);
-
-if (OPENROUTER_API_KEYS.length === 0) {
-    console.warn("[llm] No API keys — extraction will use dictionary fallback.");
-} else {
-    console.log(`[llm] ${OPENROUTER_API_KEYS.length} API key(s) loaded.`);
-}
-
-// Preferred models in priority order. fetchLiveModels() intersects this list
-// with what's actually available on OpenRouter right now, preserving order.
-// Add or reorder here if your preferred models change.
-const PREFERRED_MODELS = [
-    "openai/gpt-oss-120b:free",
-    "deepseek/deepseek-chat-v3-0324:free",
-    'openai/gpt-4o-mini',
-    'meta-llama/llama-3.1-8b-instruct',
-    'google/gemma-2-9b-it',
-    'microsoft/phi-3-mini-128k-instruct',
-    "moonshotai/kimi-k2:free",
-    "deepseek/deepseek-r1-0528:free",
-    "qwen/qwen3-235b-a22b:free",
-    "deepseek/deepseek-r1:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
+const PROVIDERS = [
+    {
+        name: "gemini",
+        keys: [process.env.GEMINI_API_KEY].filter(Boolean),
+        // Gemini has its own REST format — handled separately in callProvider()
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+        models: ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
+    },
+    {
+        name: "groq",
+        keys: [process.env.GROQ_API_KEY].filter(Boolean),
+        baseUrl: "https://api.groq.com/openai/v1",
+        // Groq is OpenAI-compatible. llama-3.3-70b is the best free model for JSON extraction.
+        models: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+    },
+    {
+        name: "openrouter",
+        keys: [
+            process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY,
+            process.env.OPENROUTER_API_KEY_2,
+            process.env.OPENROUTER_API_KEY_3,
+        ].filter(Boolean),
+        baseUrl: "https://openrouter.ai/api/v1",
+        models: [], // populated at boot by fetchLiveOpenRouterModels()
+        preferredModels: [
+            "openai/gpt-oss-120b:free",
+            "deepseek/deepseek-chat-v3-0324:free",
+            "moonshotai/kimi-k2:free",
+            "qwen/qwen3-235b-a22b:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ],
+    },
 ];
 
-// Populated at boot by fetchLiveModels(); falls back to PREFERRED_MODELS if
-// the fetch fails. Only models confirmed live are kept in this list.
-let ACTIVE_MODELS = [...PREFERRED_MODELS];
+// Log which providers are actually configured
+const configured = PROVIDERS.filter((p) => p.keys.length > 0).map((p) => `${p.name}(${p.keys.length} key)`);
+if (configured.length === 0) {
+    console.warn("[llm] No API keys configured — analysis will fail. Add GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY to .env");
+} else {
+    console.log(`[llm] Providers: ${configured.join(", ")}`);
+}
 
-async function fetchLiveModels() {
-    if (!OPENROUTER_API_KEYS[0]) return;
+// Fetch currently-live free models from OpenRouter and populate its model list.
+async function fetchLiveOpenRouterModels() {
+    const or = PROVIDERS.find((p) => p.name === "openrouter");
+    if (!or.keys[0]) return;
     try {
-        const res = await fetch(`${OPENROUTER_BASE_URL}/models`, {
-            headers: { Authorization: `Bearer ${OPENROUTER_API_KEYS[0]}` },
+        const res = await fetch(`${or.baseUrl}/models`, {
+            headers: { Authorization: `Bearer ${or.keys[0]}` },
         });
         const data = await res.json();
         const liveIds = new Set(
@@ -64,17 +83,16 @@ async function fetchLiveModels() {
                 .filter((m) => m.pricing?.prompt === "0" && m.pricing?.completion === "0")
                 .map((m) => m.id)
         );
-        // Keep only preferred models that are currently live, in preferred order.
-        // Fall back to the full preferred list if nothing matched (API schema change etc).
-        const filtered = PREFERRED_MODELS.filter((m) => liveIds.has(m));
-        ACTIVE_MODELS = filtered.length ? filtered : [...PREFERRED_MODELS];
-        console.log(`[llm] Active models: ${ACTIVE_MODELS.join(", ")}`);
+        const filtered = or.preferredModels.filter((m) => liveIds.has(m));
+        or.models = filtered.length ? filtered : or.preferredModels;
+        console.log(`[llm] OpenRouter live models: ${or.models.join(", ")}`);
     } catch (err) {
-        console.warn("[llm] Could not fetch live models, using preferred list:", err.message);
+        or.models = or.preferredModels;
+        console.warn("[llm] Could not fetch OpenRouter model list:", err.message);
     }
 }
 
-fetchLiveModels();
+fetchLiveOpenRouterModels();
 
 // ─── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
@@ -240,13 +258,22 @@ function jdExtractKeywords(text, limit = 20) {
     return Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, limit).map(([w]) => w);
 }
 
-// ─── LLM calls ────────────────────────────────────────────────────────────────
+// ─── LLM routing ───────────────────────────────────────────────────────────────
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+class LlmError extends Error {
+    constructor(reason, detail) {
+        super(detail || reason);
+        this.reason = reason;
+        this.detail = detail;
+    }
+}
 
 function stripJsonFences(content) {
     return content
         .trim()
-        .replace(/<think>[\s\S]*?<\/think>/gi, "")   // remove <think> blocks (qwen, deepseek-r1)
+        .replace(/<think>[\s\S]*?<\/think>/gi, "") // deepseek-r1, qwen thinking blocks
         .trim()
         .replace(/^```json\s*/i, "")
         .replace(/^```\s*/, "")
@@ -254,111 +281,104 @@ function stripJsonFences(content) {
         .trim();
 }
 
-// Iterates over (model × key) pairs. On 429 tries the next key immediately
-// (fresh quota). On 404 skips the model entirely (it's been removed).
-// Throws a structured LlmError with a human-readable `reason` so the API
-// response tells the user exactly what went wrong instead of silently
-// falling back to inaccurate dictionary-based results.
-class LlmError extends Error {
-    constructor(reason, detail) {
-        super(detail || reason);
-        this.reason = reason; // short code for the frontend to key on
-        this.detail = detail; // human-readable sentence shown to the user
-    }
+// Gemini has a different REST format from OpenAI-compatible providers
+async function callGemini(apiKey, model, systemPrompt, userPrompt) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemPrompt }] },
+            contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+            generationConfig: {
+                responseMimeType: "application/json",
+                maxOutputTokens: 800,
+                temperature: 0.1,
+            },
+        }),
+    });
+    if (res.status === 429) throw new Error("429");
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 150)}`);
+    const data = await res.json();
+    const content = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!content) throw new Error("Empty Gemini response");
+    const cleaned = stripJsonFences(content);
+    if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) throw new Error(`Not JSON: ${cleaned.slice(0, 80)}`);
+    return JSON.parse(cleaned);
 }
 
-async function callOpenRouterJSON(systemPrompt, userPrompt) {
-    if (OPENROUTER_API_KEYS.length === 0)
-        throw new LlmError("no_api_key", "No OpenRouter API key is configured. Add OPENROUTER_API_KEY to your .env file.");
+// Groq and OpenRouter both use the OpenAI chat completions format
+async function callOpenAICompat(baseUrl, apiKey, model, systemPrompt, userPrompt) {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+            model, max_tokens: 800, temperature: 0.1,
+            response_format: { type: "json_object" },
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userPrompt },
+            ],
+        }),
+    });
+    if (res.status === 429) throw new Error("429");
+    if (res.status === 404) throw new Error("404_SKIP_MODEL");
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text().catch(() => "")).slice(0, 150)}`);
+    const data = await res.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) throw new Error("Empty response");
+    const cleaned = stripJsonFences(content);
+    if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) throw new Error(`Not JSON: ${cleaned.slice(0, 80)}`);
+    return JSON.parse(cleaned);
+}
 
-    const models = ACTIVE_MODELS.length ? ACTIVE_MODELS.slice(0, 4) : PREFERRED_MODELS;
+// Tries providers in order: Gemini → Groq → OpenRouter.
+// Within each, tries model × key combinations.
+// Skips providers with no keys configured.
+async function callLLM(systemPrompt, userPrompt) {
+    const active = PROVIDERS.filter((p) => p.keys.length > 0 && p.models.length > 0);
+    if (active.length === 0)
+        throw new LlmError("no_api_key",
+            "No API keys configured. Add at least one to .env:\n" +
+            "  GEMINI_API_KEY      — free at aistudio.google.com (1,500 req/day)\n" +
+            "  GROQ_API_KEY        — free at console.groq.com    (1,000 req/day)\n" +
+            "  OPENROUTER_API_KEY  — free at openrouter.ai       (   50 req/day)"
+        );
 
-    // Track why each attempt failed so we can report the most useful reason.
     let allRateLimited = true;
-    let allUnavailable = true;
     let lastErr;
 
-    for (const model of models) {
-        for (const [idx, apiKey] of OPENROUTER_API_KEYS.entries()) {
-            const tag = `${model} (key${idx + 1})`;
-            try {
-                const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-                    body: JSON.stringify({
-                        model,
-                        max_tokens: 800,
-                        temperature: 0.1,
-                        response_format: { type: "json_object" },
-                        messages: [
-                            { role: "system", content: systemPrompt },
-                            { role: "user", content: userPrompt },
-                        ],
-                    }),
-                });
-
-                if (res.status === 429) {
-                    console.warn(`[llm] ${tag} rate-limited`);
-                    await sleep(300);
-                    lastErr = new LlmError("rate_limited", `Daily free-tier limit reached on all accounts. Resets at midnight UTC.`);
-                    allUnavailable = false;
-                    throw lastErr;
+    for (const provider of active) {
+        for (const model of provider.models) {
+            for (const [keyIdx, apiKey] of provider.keys.entries()) {
+                const tag = `${provider.name}/${model}(key${keyIdx + 1})`;
+                try {
+                    const parsed = provider.name === "gemini"
+                        ? await callGemini(apiKey, model, systemPrompt, userPrompt)
+                        : await callOpenAICompat(provider.baseUrl, apiKey, model, systemPrompt, userPrompt);
+                    console.log(`[llm] ${tag} → OK`);
+                    return { parsed, provider: provider.name, model };
+                } catch (err) {
+                    console.warn(`[llm] ${tag} failed — ${err.message}`);
+                    lastErr = err;
+                    if (err.message === "404_SKIP_MODEL") break;
+                    if (err.message !== "429") allRateLimited = false;
+                    else await sleep(300);
                 }
-
-                if (res.status === 401 || res.status === 403) {
-                    console.warn(`[llm] ${tag} auth error`);
-                    lastErr = new LlmError("auth_error", `API key ${idx + 1} was rejected (${res.status}). Check that OPENROUTER_API_KEY is correct in your .env file.`);
-                    allRateLimited = false; allUnavailable = false;
-                    throw lastErr;
-                }
-
-                if (res.status === 404) {
-                    console.warn(`[llm] ${tag} model unavailable — removing from list`);
-                    ACTIVE_MODELS = ACTIVE_MODELS.filter((m) => m !== model);
-                    allRateLimited = false;
-                    throw new Error("404_SKIP_MODEL");
-                }
-
-                if (!res.ok) {
-                    const txt = await res.text().catch(() => "");
-                    allRateLimited = false; allUnavailable = false;
-                    throw new Error(`HTTP ${res.status}: ${txt.slice(0, 150)}`);
-                }
-
-                const data = await res.json();
-                const content = data?.choices?.[0]?.message?.content;
-                if (!content) {
-                    allRateLimited = false; allUnavailable = false;
-                    throw new Error("Empty response from model");
-                }
-
-                const cleaned = stripJsonFences(content);
-                if (!cleaned.startsWith("{") && !cleaned.startsWith("[")) {
-                    allRateLimited = false; allUnavailable = false;
-                    throw new Error(`Model returned non-JSON: ${cleaned.slice(0, 80)}`);
-                }
-
-                const parsed = JSON.parse(cleaned);
-                console.log(`[llm] ${tag} → OK`);
-                return { parsed, modelUsed: model };
-            } catch (err) {
-                console.warn(`[llm] ${tag} failed — ${err.message}`);
-                lastErr = err;
-                if (err.message === "404_SKIP_MODEL") break; // skip remaining keys for this model
             }
         }
     }
 
-    // All (model × key) combinations failed — build the most useful error message.
-    if (lastErr instanceof LlmError) throw lastErr;
-
     if (allRateLimited)
-        throw new LlmError("rate_limited", "All API keys have hit their daily free-tier limit (50 req/day). Resets at midnight UTC. Add a second account key or top up credits at openrouter.ai.");
+        throw new LlmError("rate_limited",
+            "All providers have hit their daily free limits. Resets at midnight.\n" +
+            "Current daily capacity: Gemini 1,500 + Groq 1,000 + OpenRouter 50 = 2,550 req/day total.\n" +
+            "Add missing keys to .env — any provider you haven't set up yet is free capacity waiting to be used."
+        );
 
-    if (allUnavailable)
-        throw new LlmError("models_unavailable", `None of the preferred models are currently available on OpenRouter. Check https://openrouter.ai/models for the current free model list and update PREFERRED_MODELS in server.js.`);
-
-    throw new LlmError("extraction_failed", `LLM extraction failed after trying all models. Last error: ${lastErr?.message || "unknown"}`);
+    throw lastErr instanceof LlmError
+        ? lastErr
+        : new LlmError("extraction_failed", `All providers failed. Last: ${lastErr?.message || "unknown"}`);
 }
 
 // Single prompt extracts both resume and JD — half the API calls vs two separate prompts.
@@ -391,12 +411,7 @@ JD rules:
 - Max 20 items per JD array`;
 
 async function extractBothData(resumeText, jdText) {
-    // No silent fallback — if the LLM fails, the routes catch and return a
-    // structured error with the exact reason so the user knows what to fix.
-    if (OPENROUTER_API_KEYS.length === 0)
-        throw new LlmError("no_api_key", "No OpenRouter API key configured. Add OPENROUTER_API_KEY to your .env file.");
-
-    const { parsed, modelUsed } = await callOpenRouterJSON(
+    const { parsed, provider, model } = await callLLM(
         EXTRACTION_PROMPT,
         `RESUME:\n${resumeText.slice(0, 4000)}\n\n---\n\nJOB DESCRIPTION:\n${jdText.slice(0, 3000)}`
     );
@@ -412,13 +427,13 @@ async function extractBothData(resumeText, jdText) {
             experience: parsed.resume.experience || [],
             projects: parsed.resume.projects || [],
             certificates: parsed.resume.certificates || [],
-            model: modelUsed,
+            provider, model,
         },
         jdData: {
             skills: clean(parsed.jd.skills),
             keywords: clean(parsed.jd.keywords),
             certifications: clean(parsed.jd.certifications),
-            model: modelUsed,
+            provider, model,
         },
     };
 }
@@ -527,7 +542,7 @@ app.post("/api/analyze", upload.single("resume"), async (req, res) => {
         res.json({
             job: jobMeta,
             resume_char_count: resumeText.length,
-            extraction: { method: resumeData.method, model: resumeData.model || null },
+            extraction: { provider: resumeData.provider, model: resumeData.model || null },
             required_certifications: jdData.certifications || [],
             missing_certifications: missingCerts,
             resume_details: resumeData.method === "llm" ? {

@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 
-const API = "https://resumeats-1-l39r.onrender.com";
+// const API = "https://resumeats-1-l39r.onrender.com"; live url
+const API = "http://localhost:8000"; // local dev
 
 // ─── tiny hooks ───────────────────────────────────────────────────────────────
 function useCategories() {
